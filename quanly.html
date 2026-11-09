@@ -1,0 +1,463 @@
+<script>
+    // BẠN CẦN THAY THẾ CHUỖI NÀY BẰNG URL WEB APP CỦA GOOGLE APPS SCRIPT
+    const GAS_WEB_APP_URL = "https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec";
+
+    let activeOrdersData = [], bankConfig = {}, html5QrCode = null, selectedOrderId = null;
+    let currentStaff = JSON.parse(localStorage.getItem("canteen_staff_session")) || null;
+    let isLicenseExpired = false;
+
+    // Hàm gọi API giao tiếp với GAS Backend
+    async function callGAS(action, ...args) {
+      try {
+        const response = await fetch(GAS_WEB_APP_URL, {
+          method: "POST",
+          headers: { "Content-Type": "text/plain;charset=utf-8" },
+          body: JSON.stringify({ action: action, args: args })
+        });
+        return await response.json();
+      } catch (error) {
+        console.error("API Error:", error);
+        throw new Error("Lỗi kết nối đến máy chủ");
+      }
+    }
+
+    window.onload = function() {
+      if (currentStaff) unlockDashboard(currentStaff);
+    };
+
+    function handleStaffLogin(e) {
+      e.preventDefault();
+      const btn = document.getElementById("btnStaffLogin");
+      btn.disabled = true; btn.innerText = "Đang kiểm tra...";
+      
+      callGAS('loginStaff', { account: document.getElementById("staffAccount").value, password: document.getElementById("staffPassword").value })
+        .then(res => {
+          btn.disabled = false; btn.innerText = "Vào Hệ Thống";
+          if (res.success) {
+            currentStaff = res.user;
+            if (document.getElementById("staffRemember").checked) {
+              localStorage.setItem("canteen_staff_session", JSON.stringify(currentStaff));
+            }
+            unlockDashboard(currentStaff);
+          } else { alert(res.message); }
+        })
+        .catch(err => { btn.disabled = false; btn.innerText = "Vào Hệ Thống"; alert("Lỗi: " + err.message); });
+    }
+
+    function unlockDashboard(staff) {
+      document.getElementById("loginScreen").classList.add("hidden");
+      document.getElementById("mainDashboard").classList.remove("hidden");
+      document.getElementById("staffBadgeName").innerText = `${staff.fullName} (${staff.role})`;
+
+      const roleLower = String(staff.role || "").trim().toLowerCase();
+      if (roleLower === 'manager') {
+        document.getElementById("tabReports").classList.remove("hidden");
+      } else {
+        document.getElementById("tabReports").classList.add("hidden");
+      }
+
+      checkLicense();
+      loadCanteenSettings();
+      loadBankConfigUI();
+      fetchData();
+      setInterval(fetchData, 5000);
+    }
+
+    function logoutStaff() {
+      if (confirm("Bạn có muốn đăng xuất?")) {
+        currentStaff = null;
+        localStorage.removeItem("canteen_staff_session");
+        location.reload();
+      }
+    }
+
+    function handleReportsTabClick() {
+      if (isLicenseExpired) {
+        alert("⛔ BẢN QUYỀN ĐÃ HẾT HẠN!\nChức năng Báo Cáo & Quản Lý tạm thời bị khóa. Vui lòng chuyển sang tab 'Bản Quyền' để nhập mã kích hoạt gia hạn.");
+        switchTab('license');
+        return;
+      }
+      switchTab('reports');
+    }
+
+    function switchTab(tab) {
+      if (tab === 'reports' && isLicenseExpired) {
+        alert("⛔ BẢN QUYỀN ĐÃ HẾT HẠN!\nChức năng Báo Cáo & Quản Lý tạm thời bị khóa. Vui lòng gia hạn mã bản quyền để sử dụng.");
+        tab = 'license';
+      }
+
+      ['kitchen', 'cashier', 'menuMgmt', 'license', 'reports'].forEach(t => {
+        const v = document.getElementById('view' + t.charAt(0).toUpperCase() + t.slice(1));
+        const b = document.getElementById('tab' + t.charAt(0).toUpperCase() + t.slice(1));
+        if (v) v.classList.add('hidden');
+        if (b) {
+          b.className = "px-3 py-1.5 rounded-lg text-xs font-bold text-slate-400 hover:text-white transition flex items-center gap-1";
+          if (t === 'reports' && isLicenseExpired) b.classList.add('opacity-50');
+        }
+      });
+
+      const activeView = document.getElementById('view' + tab.charAt(0).toUpperCase() + tab.slice(1));
+      const activeBtn = document.getElementById('tab' + tab.charAt(0).toUpperCase() + tab.slice(1));
+      if (activeView) activeView.classList.remove('hidden');
+      if (activeBtn) activeBtn.className = "px-3 py-1.5 rounded-lg text-xs font-bold bg-amber-500 text-slate-900 transition flex items-center gap-1";
+
+      if (tab === 'menuMgmt') loadMenuItems();
+      if (tab === 'license') checkLicense();
+      if (tab === 'reports') { loadRevenue('day'); loadBankConfigUI(); }
+    }
+
+    // ==================== CẤU HÌNH NGÂN HÀNG VIETQR ====================
+    function loadBankConfigUI() {
+      callGAS('getBankConfig').then(res => {
+        if (res && res.success) {
+          document.getElementById("bankIdSelect").value = res.bankId || "MB";
+          document.getElementById("bankAccountNoInput").value = res.accountNo || "";
+          document.getElementById("bankAccountNameInput").value = res.accountName || "";
+          bankConfig = { bankId: res.bankId, accountNo: res.accountNo, accountName: res.accountName };
+        }
+      });
+    }
+
+    function saveBankConfig() {
+      if (isLicenseExpired) {
+        alert("⛔ Bản quyền phần mềm đã hết hạn! Vui lòng gia hạn để cập nhật cấu hình tài khoản.");
+        switchTab('license');
+        return;
+      }
+
+      const data = {
+        bankId: document.getElementById("bankIdSelect").value,
+        accountNo: document.getElementById("bankAccountNoInput").value.trim(),
+        accountName: document.getElementById("bankAccountNameInput").value.trim()
+      };
+
+      if (!data.accountNo) return alert("Vui lòng nhập số tài khoản ngân hàng!");
+
+      const btn = document.getElementById("btnSaveBank");
+      btn.disabled = true; btn.innerText = "Đang lưu...";
+
+      callGAS('updateBankConfig', data, currentStaff ? currentStaff.email : "").then(res => {
+        btn.disabled = false; btn.innerHTML = `<i class="fa-solid fa-floppy-disk"></i> Lưu Cấu Hình Ngân Hàng`;
+        alert(res.message);
+        if (res.isExpired) { isLicenseExpired = true; checkLicense(); switchTab('license'); return; }
+        if (res.success) bankConfig = data;
+      });
+    }
+
+    // ==================== THÊM USER VÀ PHÂN QUYỀN ====================
+    function handleAddUserWithRole(e) {
+      e.preventDefault();
+      if (isLicenseExpired) {
+        alert("⛔ Bản quyền phần mềm đã hết hạn! Vui lòng gia hạn để thêm người dùng.");
+        switchTab('license'); return;
+      }
+
+      const btn = document.getElementById("btnAddStaffSubmit");
+      btn.disabled = true; btn.innerText = "Đang thêm...";
+
+      const userData = {
+        fullName: document.getElementById("newStaffName").value.trim(),
+        phone: document.getElementById("newStaffPhone").value.trim(),
+        email: document.getElementById("newStaffEmail").value.trim().toLowerCase(),
+        role: document.getElementById("newStaffRole").value,
+        password: document.getElementById("newStaffPassword").value.trim()
+      };
+
+      callGAS('addUserWithRole', userData, currentStaff ? currentStaff.email : "").then(res => {
+        btn.disabled = false; btn.innerHTML = `<i class="fa-solid fa-user-check"></i> Tạo Người Dùng & Phân Quyền`;
+        alert(res.message);
+        if (res.isExpired) { isLicenseExpired = true; checkLicense(); switchTab('license'); return; }
+        if (res.success) {
+          document.getElementById("newStaffName").value = "";
+          document.getElementById("newStaffPhone").value = "";
+          document.getElementById("newStaffEmail").value = "";
+          document.getElementById("newStaffPassword").value = "";
+        }
+      });
+    }
+
+    // ==================== BÁO CÁO DOANH THU ====================
+    function loadRevenue(period) {
+      if (isLicenseExpired) {
+        alert("⛔ Bản quyền phần mềm đã hết hạn! Chức năng Báo Cáo & Quản Lý đã bị khóa.");
+        switchTab('license'); return;
+      }
+
+      ['Day', 'Week', 'Month', 'Quarter', 'Year'].forEach(p => {
+        document.getElementById('btnRev' + p).className = "px-3 py-1 rounded-lg text-xs font-bold text-slate-400 hover:text-white transition";
+      });
+      document.getElementById('btnRev' + period.charAt(0).toUpperCase() + period.slice(1)).className = "px-3 py-1 rounded-lg text-xs font-bold bg-amber-500 text-slate-900 transition";
+
+      callGAS('getRevenueAnalytics', period, currentStaff ? currentStaff.email : "").then(res => {
+        if (res.isExpired) { isLicenseExpired = true; checkLicense(); alert(res.message); switchTab('license'); return; }
+        if (!res.success) { alert(res.message); return; }
+        
+        document.getElementById("statTotalRev").innerText = res.totalRevenue.toLocaleString('vi-VN') + " ₫";
+        document.getElementById("statOrderCount").innerText = res.orderCount + " đơn";
+        document.getElementById("statAvgOrder").innerText = res.avgOrder.toLocaleString('vi-VN') + " ₫";
+
+        const tbody = document.getElementById("topItemsTableBody"); tbody.innerHTML = "";
+        if (res.topItems.length === 0) {
+          tbody.innerHTML = `<tr><td colspan="4" class="p-3 text-center text-slate-500">Chưa có đơn hàng nào trong khoảng thời gian này.</td></tr>`; return;
+        }
+        res.topItems.forEach((it, idx) => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td class="p-3 font-bold text-amber-400">#${idx + 1}</td>
+            <td class="p-3 font-bold text-white">${it.name}</td>
+            <td class="p-3 text-center font-bold text-slate-200">${it.qty}</td>
+            <td class="p-3 text-right font-semibold text-emerald-400">${it.revenue.toLocaleString('vi-VN')} ₫</td>
+          `;
+          tbody.appendChild(tr);
+        });
+      });
+    }
+
+    // ==================== BẢN QUYỀN ====================
+    function checkLicense() {
+      callGAS('checkLicenseStatus').then(res => {
+        if (!res.success) return;
+        isLicenseExpired = !!res.isExpired;
+
+        document.getElementById("licenseExpiryDisplay").innerText = `${res.expiryDate} (Còn ${res.daysLeft} ngày)`;
+        const warnBanner = document.getElementById("licenseWarningBanner");
+        const expBanner = document.getElementById("licenseExpiredBanner");
+        const badgeLock = document.getElementById("badgeReportsLock");
+        const tabReports = document.getElementById("tabReports");
+        const reportsNotice = document.getElementById("reportsLockNotice");
+        const licBadge = document.getElementById("licenseBadgeStatus");
+
+        if (res.isExpired) {
+          expBanner.classList.remove("hidden"); warnBanner.classList.add("hidden");
+          if (badgeLock) badgeLock.classList.remove("hidden");
+          if (tabReports) tabReports.classList.add("opacity-50");
+          if (reportsNotice) reportsNotice.classList.remove("hidden");
+          if (licBadge) { licBadge.className = "px-3.5 py-1.5 rounded-full text-xs font-bold bg-red-500/20 text-red-400 border border-red-500/40"; licBadge.innerText = "Hết hạn"; }
+
+          const viewReports = document.getElementById("viewReports");
+          if (viewReports && !viewReports.classList.contains("hidden")) {
+            switchTab("license"); alert("⛔ Bản quyền phần mềm đã hết hạn! Chức năng Báo Cáo & Quản Lý đã bị khóa.");
+          }
+        } else if (res.isWarning) {
+          warnBanner.classList.remove("hidden"); expBanner.classList.add("hidden");
+          if (badgeLock) badgeLock.classList.add("hidden");
+          if (tabReports) tabReports.classList.remove("opacity-50");
+          if (reportsNotice) reportsNotice.classList.add("hidden");
+          if (licBadge) { licBadge.className = "px-3.5 py-1.5 rounded-full text-xs font-bold bg-amber-500/20 text-amber-400 border border-amber-500/40"; licBadge.innerText = "Sắp hết hạn"; }
+          document.getElementById("licenseWarningText").innerText = `⚠️ CẢNH BÁO: Bản quyền phần mềm còn ${res.daysLeft} ngày (Hết hạn ngày ${res.expiryDate}). Vui lòng gia hạn!`;
+        } else {
+          warnBanner.classList.add("hidden"); expBanner.classList.add("hidden");
+          if (badgeLock) badgeLock.classList.add("hidden");
+          if (tabReports) tabReports.classList.remove("opacity-50");
+          if (reportsNotice) reportsNotice.classList.add("hidden");
+          if (licBadge) { licBadge.className = "px-3.5 py-1.5 rounded-full text-xs font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40"; licBadge.innerText = "Còn hạn"; }
+        }
+      });
+    }
+
+    function handleActivateLicense() {
+      const code = document.getElementById("licenseCodeInput").value.trim();
+      if (!code || code.length !== 6) return alert("Vui lòng nhập đúng mã kích hoạt 6 chữ số!");
+      const btn = document.getElementById("btnActivateLicense");
+      btn.disabled = true; btn.innerText = "Đang kiểm tra...";
+
+      callGAS('activateLicenseCode', code, currentStaff ? currentStaff.email : "").then(res => {
+        btn.disabled = false; btn.innerText = "Kích Hoạt / Gia Hạn";
+        alert(res.message);
+        if (res.success) { document.getElementById("licenseCodeInput").value = ""; checkLicense(); }
+      });
+    }
+
+    // ==================== OTP NHÂN VIÊN ====================
+    function openStaffForgotModal() {
+      document.getElementById("staffOtpStep1").classList.remove("hidden");
+      document.getElementById("staffOtpStep2").classList.add("hidden");
+      if (currentStaff) document.getElementById("staffForgotEmail").value = currentStaff.email;
+      document.getElementById("staffForgotModal").classList.remove("hidden");
+    }
+    function closeStaffForgotModal() { document.getElementById("staffForgotModal").classList.add("hidden"); }
+
+    function sendStaffOtpAction() {
+      const email = document.getElementById("staffForgotEmail").value.trim();
+      if (!email) return alert("Vui lòng nhập email!");
+      const btn = document.getElementById("btnSendStaffOtp");
+      btn.disabled = true; btn.innerText = "Đang gửi OTP...";
+
+      callGAS('sendStaffOTP', email).then(res => {
+        btn.disabled = false; btn.innerText = "Gửi Mã OTP";
+        alert(res.message);
+        if (res.success) {
+          document.getElementById("staffOtpStep1").classList.add("hidden");
+          document.getElementById("staffOtpStep2").classList.remove("hidden");
+        }
+      });
+    }
+
+    function submitStaffResetPass() {
+      const email = document.getElementById("staffForgotEmail").value.trim();
+      const otp = document.getElementById("staffOtpInput").value.trim();
+      const pass = document.getElementById("staffNewPassword").value.trim();
+      if (!otp || !pass) return alert("Vui lòng nhập đủ mã OTP và mật khẩu mới!");
+
+      callGAS('resetStaffPassword', email, otp, pass).then(res => {
+        alert(res.message);
+        if (res.success) closeStaffForgotModal();
+      });
+    }
+
+    function loadCanteenSettings() {
+      callGAS('getCanteenSettings').then(res => {
+        if (res && res.success) {
+          document.getElementById("internalCanteenName").innerText = res.canteenName;
+          document.getElementById("settingCanteenName").value = res.canteenName;
+          document.getElementById("settingCanteenSubtitle").value = res.canteenSubtitle;
+        }
+      });
+    }
+
+    function saveCanteenSettings() {
+      callGAS('updateCanteenSettings', { canteenName: document.getElementById("settingCanteenName").value, canteenSubtitle: document.getElementById("settingCanteenSubtitle").value }).then(res => {
+        alert("Đã cập nhật tên căn tin thành công!");
+        document.getElementById("internalCanteenName").innerText = document.getElementById("settingCanteenName").value;
+      });
+    }
+
+    function loadMenuItems() {
+      callGAS('getAllMenuItems').then(items => {
+        const tbody = document.getElementById("menuItemsTableBody"); tbody.innerHTML = "";
+        items.forEach(it => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td class="p-3 font-mono text-slate-400">${it.id}</td><td class="p-3 font-bold text-white">${it.name}</td><td class="p-3">${it.category}</td><td class="p-3 text-emerald-400">${it.price.toLocaleString('vi-VN')} ₫</td><td class="p-3">${it.stock}</td>
+            <td class="p-3 text-right space-x-1">
+              <button onclick='openEditItem(${JSON.stringify(it)})' class="p-1 bg-amber-500/20 text-amber-300 rounded"><i class="fa-solid fa-pen"></i></button>
+              <button onclick="btnDeleteItem('${it.id}')" class="p-1 bg-red-500/20 text-red-300 rounded"><i class="fa-solid fa-trash"></i></button>
+            </td>`;
+          tbody.appendChild(tr);
+        });
+      });
+    }
+
+    function openItemModal() { document.getElementById("itemModal").classList.remove("hidden"); }
+    function closeItemModal() { document.getElementById("itemModal").classList.add("hidden"); }
+    function openEditItem(it) {
+      document.getElementById("editItemId").value = it.id;
+      document.getElementById("itemName").value = it.name;
+      document.getElementById("itemCategory").value = it.category;
+      document.getElementById("itemPrice").value = it.price;
+      document.getElementById("itemCalo").value = it.calories;
+      document.getElementById("itemStock").value = it.stock;
+      document.getElementById("itemImg").value = it.imageUrl;
+      openItemModal();
+    }
+    function submitSaveItem() {
+      callGAS('saveMenuItem', { id: document.getElementById("editItemId").value, name: document.getElementById("itemName").value, category: document.getElementById("itemCategory").value, price: Number(document.getElementById("itemPrice").value), calories: Number(document.getElementById("itemCalo").value), stock: Number(document.getElementById("itemStock").value), imageUrl: document.getElementById("itemImg").value }).then(() => { closeItemModal(); loadMenuItems(); });
+    }
+    function btnDeleteItem(id) { if (confirm("Xóa món này?")) callGAS('deleteMenuItem', id).then(loadMenuItems); }
+
+    function fetchData() {
+      callGAS('getActiveOrders').then(res => {
+        if (!res.success) return;
+        activeOrdersData = res.orders || [];
+        bankConfig = res.bankConfig || bankConfig;
+        renderRushMode(res.rushSummary || {});
+        renderKitchenKDS();
+        renderCashier();
+      });
+    }
+
+    function renderRushMode(rushSummary) {
+      const c = document.getElementById("rushContainer"); c.innerHTML = "";
+      const keys = Object.keys(rushSummary);
+      document.getElementById("rushTotalOrders").innerText = `${activeOrdersData.filter(o => o.status === "Đang chuẩn bị").length} đơn chờ`;
+      if (keys.length === 0) { c.innerHTML = `<p class="text-xs text-slate-500 italic">Không có món chờ nấu...</p>`; return; }
+      keys.forEach(k => { c.innerHTML += `<div class="bg-amber-500/20 text-amber-300 px-3 py-1 rounded-xl text-xs font-bold">${k} <span class="bg-amber-500 text-slate-900 px-1.5 rounded">${rushSummary[k]}</span></div>`; });
+    }
+
+    // HIỂN THỊ PHIẾU BẾP (KDS)
+    function renderKitchenKDS() {
+      const c = document.getElementById("kitchenTicketsGrid"); c.innerHTML = "";
+      const list = activeOrdersData.filter(o => o.status === "Đang chuẩn bị");
+      if (list.length === 0) { c.innerHTML = `<div class="col-span-full text-center py-12 text-slate-500 text-xs">Đã nấu xong tất cả các món!</div>`; return; }
+
+      list.forEach(o => {
+        let itHtml = o.items.map(it => `
+          <div class="py-1 border-b border-slate-700/50">
+            <div class="flex justify-between items-center text-xs"><span class="font-bold text-white">${it.itemName}</span><span class="text-amber-400 font-extrabold text-sm">x${it.qty}</span></div>
+            ${it.notes ? `<p class="text-[11px] text-amber-300 italic pl-2 border-l-2 border-amber-500 mt-0.5">${it.notes}</p>` : ''}
+          </div>
+        `).join("");
+
+        let noteHtml = o.notes ? `<div class="mt-2.5 p-2 bg-amber-500/15 border border-amber-500/50 rounded-xl text-xs"><div class="font-black uppercase tracking-wider text-[10px] text-amber-400 flex items-center gap-1 mb-0.5"><i class="fa-solid fa-note-sticky text-amber-400"></i> Ghi Chú Của Khách:</div><p class="font-medium text-amber-200 italic leading-snug">${o.notes}</p></div>` : "";
+
+        c.innerHTML += `
+          <div class="bg-slate-800 border-2 border-slate-700 rounded-2xl p-4 flex flex-col justify-between shadow-lg">
+            <div>
+              <div class="flex justify-between items-center pb-2 border-b border-slate-700"><span class="text-2xl font-black text-amber-400">${o.shortId}</span><span class="text-xs text-slate-400 flex items-center gap-1 font-semibold"><i class="fa-regular fa-clock"></i> ${o.pickupTime}</span></div>
+              <div class="mt-2 text-xs space-y-1">
+                <p class="font-extrabold text-white text-sm">${o.customerName}</p>
+                ${o.customerPhone ? `<p class="text-slate-300 flex items-center gap-1.5"><i class="fa-solid fa-phone text-amber-400 text-[10px]"></i> <span class="font-mono">${o.customerPhone}</span></p>` : ''}
+                ${o.customerEmail ? `<p class="text-slate-400 flex items-center gap-1.5 truncate"><i class="fa-solid fa-envelope text-amber-400 text-[10px]"></i> <span>${o.customerEmail}</span></p>` : ''}
+              </div>
+              ${noteHtml}
+              <div class="mt-3 text-xs space-y-1">${itHtml}</div>
+            </div>
+            <button onclick="btnMarkReady('${o.orderId}')" class="mt-4 w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-black rounded-xl text-xs uppercase tracking-wider transition shadow-lg shadow-emerald-600/20"><i class="fa-solid fa-check mr-1"></i> Nấu Xong</button>
+          </div>`;
+      });
+    }
+
+    // HIỂN THỊ THẺ THU NGÂN
+    function renderCashier(filtered) {
+      const c = document.getElementById("cashierCardsGrid"); c.innerHTML = "";
+      const list = filtered || activeOrdersData;
+      if (list.length === 0) { c.innerHTML = `<div class="col-span-full text-center py-12 text-slate-500 text-xs">Không có đơn bàn giao.</div>`; return; }
+
+      list.forEach(o => {
+        c.innerHTML += `
+          <div class="p-4 rounded-2xl border ${o.status === 'Chờ lấy đồ' ? 'bg-slate-800 border-emerald-500 shadow-emerald-500/10' : 'bg-slate-800/60 border-slate-700'} space-y-2">
+            <div class="flex justify-between items-center"><span class="text-xl font-black text-white">${o.shortId}</span><span class="text-xs px-2 py-0.5 rounded font-bold ${o.status === 'Chờ lấy đồ' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400'}">${o.status}</span></div>
+            <div class="text-xs">
+              <p class="font-bold text-white text-sm">${o.customerName}</p>
+              ${o.customerPhone ? `<p class="text-slate-300 text-[11px] font-mono mt-0.5"><i class="fa-solid fa-phone text-amber-400 mr-1"></i>${o.customerPhone}</p>` : ''}
+              ${o.customerEmail ? `<p class="text-slate-400 text-[11px] truncate"><i class="fa-solid fa-envelope text-amber-400 mr-1"></i>${o.customerEmail}</p>` : ''}
+            </div>
+            ${o.notes ? `<div class="text-[11px] bg-amber-500/15 border border-amber-500/30 text-amber-300 p-2 rounded-lg italic"><b>Ghi chú:</b> ${o.notes}</div>` : ''}
+            <div class="pt-1 flex justify-between items-center border-t border-slate-700/50"><span class="text-xs text-slate-400">Tổng thanh toán:</span><span class="text-base font-extrabold text-emerald-400">${o.totalAmount.toLocaleString('vi-VN')} ₫</span></div>
+            <button onclick="openPaymentModal('${o.orderId}')" class="w-full py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-xl text-xs transition">Thu Tiền & Giao Món</button>
+          </div>`;
+      });
+    }
+
+    function handleSearch(val) {
+      const q = val.trim().toLowerCase();
+      renderCashier(q ? activeOrdersData.filter(o => o.shortId.toLowerCase().includes(q) || o.customerName.toLowerCase().includes(q) || (o.customerPhone && o.customerPhone.includes(q))) : null);
+    }
+
+    function btnMarkReady(id) { callGAS('markOrderReady', id).then(fetchData); }
+
+    function openPaymentModal(id) {
+      const o = activeOrdersData.find(x => x.orderId === id); if (!o) return;
+      selectedOrderId = id;
+      document.getElementById("payShortId").innerText = o.shortId;
+      document.getElementById("payCustomerName").innerText = o.customerName;
+      document.getElementById("payAmount").innerText = o.totalAmount.toLocaleString('vi-VN') + " ₫";
+
+      const currentBank = bankConfig.bankId || "MB", currentAcc = bankConfig.accountNo || "090123456789", currentName = bankConfig.accountName || "SMART CANTEEN";
+      document.getElementById("vietqrImg").src = `https://img.vietqr.io/image/${currentBank}-${currentAcc}-compact.png?amount=${o.totalAmount}&addInfo=${o.orderId}&accountName=${encodeURIComponent(currentName)}`;
+      document.getElementById("vietqrBankInfo").innerText = `${currentBank}: ${currentAcc} (${currentName})`;
+      document.getElementById("paymentModal").classList.remove("hidden");
+    }
+
+    function closePaymentModal() { document.getElementById("paymentModal").classList.add("hidden"); }
+    function confirmComplete(method) { callGAS('completeOrder', selectedOrderId, method).then(() => { closePaymentModal(); fetchData(); }); }
+
+    function toggleQRScanner() {
+      const box = document.getElementById("qrScannerBox");
+      if (box.classList.contains("hidden")) {
+        box.classList.remove("hidden");
+        html5QrCode = new Html5Qrcode("reader");
+        html5QrCode.start({ facingMode: "environment" }, { fps: 10, qrbox: 200 }, (t) => { html5QrCode.stop(); box.classList.add("hidden"); openPaymentModal(t); }, (e)=>{});
+      } else { if (html5QrCode) html5QrCode.stop(); box.classList.add("hidden"); }
+    }
+  </script>
